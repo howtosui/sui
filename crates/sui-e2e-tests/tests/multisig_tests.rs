@@ -1,11 +1,13 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::time::Duration;
+
 use fastcrypto::traits::EncodeDecodeBase64;
 use shared_crypto::intent::{Intent, IntentMessage};
-use std::time::Duration;
 use sui_core::authority_client::AuthorityAPI;
 use sui_macros::sim_test;
+use sui_protocol_config::ProtocolConfig;
 use sui_test_transaction_builder::TestTransactionBuilder;
 use sui_types::{
     base_types::SuiAddress,
@@ -22,6 +24,7 @@ use sui_types::{
     zk_login_authenticator::ZkLoginAuthenticator,
 };
 use test_cluster::{TestCluster, TestClusterBuilder};
+
 async fn do_upgraded_multisig_test() -> SuiResult {
     let test_cluster = TestClusterBuilder::new().build().await;
     let tx = make_upgraded_multisig_tx();
@@ -40,8 +43,6 @@ async fn do_upgraded_multisig_test() -> SuiResult {
 
 #[sim_test]
 async fn test_upgraded_multisig_feature_deny() {
-    use sui_protocol_config::ProtocolConfig;
-
     let _guard = ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
         config.set_upgraded_multisig_for_testing(false);
         config
@@ -54,8 +55,6 @@ async fn test_upgraded_multisig_feature_deny() {
 
 #[sim_test]
 async fn test_upgraded_multisig_feature_allow() {
-    use sui_protocol_config::ProtocolConfig;
-
     let _guard = ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
         config.set_upgraded_multisig_for_testing(true);
         config
@@ -175,6 +174,11 @@ async fn test_multisig_e2e() {
 
 #[sim_test]
 async fn test_multisig_with_zklogin_scenerios() {
+    let _guard = ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
+        config.set_accept_zklogin_in_multisig_for_testing(true);
+        config.set_zklogin_upper_bound_max_epoch(Some(11));
+        config
+    });
     let test_cluster = TestClusterBuilder::new().with_default_jwks().build().await;
     test_cluster.wait_for_authenticator_state_update().await;
     let rgp = test_cluster.get_reference_gas_price().await;
@@ -635,15 +639,24 @@ async fn test_multisig_with_zklogin_scenerios() {
 
 #[sim_test]
 async fn test_expired_epoch_zklogin_in_multisig() {
-    // 17. expired zklogin sig fails to execute. wait till epoch 11, the zklogin input committed to max_epoch 10 fails to execute.
     let test_cluster = TestClusterBuilder::new()
         .with_default_jwks()
         .with_epoch_duration_ms(1000)
         .build()
         .await;
     test_cluster.wait_for_authenticator_state_update().await;
+
+    // max epoch (10) set larger than upper bound of current epoch + 2 fails.
+    let tx = construct_simple_zklogin_multisig_tx(&test_cluster).await;
+    let res = test_cluster.wallet.execute_transaction_may_fail(tx).await;
+    assert!(res
+        .unwrap_err()
+        .to_string()
+        .contains("ZKLogin max epoch too large 10"));
+
+    // expired zklogin sig fails to execute. wait till epoch 11, the zklogin input committed to max_epoch 10 fails to execute.
     test_cluster
-        .wait_for_epoch_with_timeout(Some(11), Duration::from_secs(300))
+        .wait_for_epoch_with_timeout(Some(11), Duration::from_secs(180))
         .await;
     let tx = construct_simple_zklogin_multisig_tx(&test_cluster).await;
     let res = test_cluster.wallet.execute_transaction_may_fail(tx).await;
@@ -657,8 +670,15 @@ async fn test_expired_epoch_zklogin_in_multisig() {
 async fn test_random_zklogin_in_multisig() {
     let test_vectors =
         &load_test_vectors("../sui-types/src/unit_tests/zklogin_test_vectors.json")[1..11];
-    let test_cluster = TestClusterBuilder::new().with_default_jwks().build().await;
-    test_cluster.wait_for_authenticator_state_update().await;
+    let test_cluster = TestClusterBuilder::new()
+        .with_epoch_duration_ms(1000)
+        .with_default_jwks()
+        .build()
+        .await;
+    test_cluster
+        .wait_for_epoch_with_timeout(Some(9), Duration::from_secs(190))
+        .await;
+
     let rgp = test_cluster.get_reference_gas_price().await;
     let context = &test_cluster.wallet;
 
@@ -737,14 +757,17 @@ async fn test_multisig_legacy_works() {
 
 #[sim_test]
 async fn test_zklogin_inside_multisig_feature_deny() {
-    use sui_protocol_config::ProtocolConfig;
-
     // if feature disabled, fails to execute.
     let _guard = ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
         config.set_accept_zklogin_in_multisig_for_testing(false);
+        config.set_zklogin_upper_bound_max_epoch(Some(10));
         config
     });
-    let test_cluster = TestClusterBuilder::new().with_default_jwks().build().await;
+    let test_cluster = TestClusterBuilder::new()
+        .with_default_jwks()
+        .with_epoch_duration_ms(1000)
+        .build()
+        .await;
     test_cluster.wait_for_authenticator_state_update().await;
     let tx = construct_simple_zklogin_multisig_tx(&test_cluster).await;
     let res = test_cluster.wallet.execute_transaction_may_fail(tx).await;

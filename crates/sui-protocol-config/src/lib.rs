@@ -394,6 +394,9 @@ struct FeatureFlags {
     // Limit PTBs that contain invalid commands after one that uses Random.
     #[serde(skip_serializing_if = "is_false")]
     enable_randomness_ptb_restrictions: bool,
+    // Set the upper bound (current epoch + zklogin_upper_bound_max_epoch) for the max_epoch field of a zklogin signature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zklogin_upper_bound_max_epoch: Option<u64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1174,6 +1177,9 @@ impl ProtocolConfig {
     pub fn enable_randomness_ptb_restrictions(&self) -> bool {
         self.feature_flags.enable_randomness_ptb_restrictions
     }
+    pub fn zklogin_upper_bound_max_epoch(&self) -> Option<u64> {
+        self.feature_flags.zklogin_upper_bound_max_epoch
+    }
 }
 
 #[cfg(not(msim))]
@@ -1924,6 +1930,8 @@ impl ProtocolConfig {
                 38 => {}
                 39 => {
                     cfg.feature_flags.enable_randomness_ptb_restrictions = true;
+                    // Set the upper bound of the max_epoch field for a zklogin signature.
+                    cfg.feature_flags.zklogin_upper_bound_max_epoch = Some(2);
                 }
                 // Use this template when making changes:
                 //
@@ -2019,6 +2027,9 @@ impl ProtocolConfig {
     }
     pub fn set_consensus_max_transactions_in_block_bytes(&mut self, val: u64) {
         self.consensus_max_transactions_in_block_bytes = Some(val);
+    }
+    pub fn set_zklogin_upper_bound_max_epoch(&mut self, val: Option<u64>) {
+        self.feature_flags.zklogin_upper_bound_max_epoch = val
     }
 }
 
