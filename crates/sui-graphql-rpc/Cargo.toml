@@ -57,6 +57,7 @@ tower.workspace = true
 tower-http.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+im.workspace = true
 
 sui-graphql-rpc-headers.workspace = true
 sui-graphql-rpc-client.workspace = true
@@ -75,7 +76,6 @@ test-cluster.workspace = true
 sui-protocol-config.workspace = true
 move-bytecode-utils.workspace = true
 sui-package-resolver.workspace = true
-im.workspace = true
 
 [dev-dependencies]
 expect-test.workspace = true

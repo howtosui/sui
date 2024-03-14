@@ -3,6 +3,7 @@
 
 use std::str::FromStr;
 
+use crate::types::base64::Base64 as GraphQLBase64;
 use async_graphql::{connection::Connection, *};
 use fastcrypto::encoding::{Base64, Encoding};
 use move_core_types::account_address::AccountAddress;
@@ -14,6 +15,7 @@ use sui_types::transaction::{TransactionData, TransactionKind};
 use sui_types::{gas_coin::GAS, transaction::TransactionDataAPI, TypeTag};
 
 use super::suins_registration::NameService;
+use super::zklogin_verify_signature::{verify_zklogin_signature_inner, ZkLoginVerifyResult};
 use super::{
     address::Address,
     available_range::AvailableRange,
@@ -36,7 +38,6 @@ use super::{
     transaction_metadata::TransactionMetadata,
     type_filter::ExactTypeFilter,
 };
-use crate::zklogin_verify_signature::{ZkLoginVerify, ZkLoginVerifyResult};
 use crate::{
     config::ServiceConfig, context_data::db_data_provider::PgManager, data::Db, error::Error,
     mutation::Mutation,
@@ -395,24 +396,28 @@ impl Query {
             .extend()
     }
 
-    /// Verify a zkLogin signature.
+    /// Verify a zkLogin signature based on the provided transaction or personal message
+    /// based on current epoch, chain id, and latest JWKs fetched on-chain.
+    /// If the signature is valid, the function returns a `ZkLoginVerifyResult` with no
+    /// errors. If the signature is invalid, the function returns a `ZkLoginVerifyResult`
+    /// with a list of errors.
+    ///
+    /// - `bytes` is either the personal message in raw bytes or transaction data bytes in
+    ///    BCS-encoded and then Base64-encoded.
+    /// - `signature` is a serialized zkLogin signature that is Base64-encoded.
+    /// - `intent_scope` is a u64 representing the intent scope of bytes.
+    /// - `author` is the address of the signer of the transaction or personal msg.
     async fn verify_zklogin_signature(
         &self,
         ctx: &Context<'_>,
-        bytes: String,
-        signature: String,
+        bytes: GraphQLBase64,
+        signature: GraphQLBase64,
         intent_scope: u64,
         author: SuiAddress,
     ) -> Result<ZkLoginVerifyResult> {
-        ZkLoginVerify::verify_zklogin_signature(
-            ctx.data_unchecked(),
-            bytes,
-            signature,
-            intent_scope,
-            author,
-        )
-        .await
-        .extend()
+        verify_zklogin_signature_inner(ctx.data_unchecked(), bytes, signature, intent_scope, author)
+            .await
+            .extend()
     }
 }
 
