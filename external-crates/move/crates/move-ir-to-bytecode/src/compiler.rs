@@ -15,6 +15,7 @@ use move_binary_format::{
     file_format_common::VERSION_MAX,
 };
 use move_bytecode_source_map::source_map::SourceMap;
+use move_command_line_common::error_bitset::ErrorBitset;
 use move_core_types::runtime_value::{MoveTypeLayout, MoveValue};
 use move_ir_types::{
     ast::{self, Bytecode as IRBytecode, Bytecode_ as IRBytecode_, *},
@@ -1659,6 +1660,34 @@ fn compile_bytecode(
             let tokens = compile_type(context, function_frame.type_parameters(), &ty)?;
             let sig = Signature(vec![tokens]);
             Bytecode::VecSwap(context.signature_index(sig)?)
+        }
+        IRBytecode_::ErrorConstant {
+            line_number,
+            constant,
+        } => {
+            // look up the constant's value
+            let constant_value_index: u16 = match &constant {
+                Some(const_name) => context.named_constant_index(const_name)?.0,
+                None => TableIndex::MAX,
+            };
+
+            // look up the constant's name, as a constant valeu -- this may be present already,
+            // e.g., in the case of something like `const Foo: vector<u8> = b"Foo"`.
+            let constant_name_index: u16 = match constant {
+                Some(const_name) => {
+                    let constant = compile_constant(
+                        context,
+                        Type::Vector(Box::new(Type::U8)),
+                        MoveValue::vector_u8(const_name.to_string().into_bytes()),
+                    )?;
+                    // Will add if not present, and will return the index, or will just return
+                    // index if already present.
+                    context.constant_index(constant)?.0
+                }
+                None => TableIndex::MAX,
+            };
+            let bitset = ErrorBitset::new(line_number, constant_name_index, constant_value_index).bits;
+            Bytecode::LdU64(bitset)
         }
     };
     push_instr!(loc, ff_instr);

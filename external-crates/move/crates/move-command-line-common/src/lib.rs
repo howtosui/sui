@@ -13,3 +13,4 @@ pub mod parser;
 pub mod testing;
 pub mod types;
 pub mod values;
+pub mod error_bitset;

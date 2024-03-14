@@ -403,6 +403,7 @@ fn constant(
     n: ConstantName,
     c: G::Constant,
 ) -> IR::Constant {
+    context.add_constant_definition_attributes(m, n, c.attributes);
     let name = context.constant_definition_name(m, n);
     let signature = base_type(context, c.signature);
     let value = c.value.unwrap();
@@ -785,7 +786,7 @@ fn command(context: &mut Context, code: &mut IR::BytecodeBlock, sp!(loc, cmd_): 
             code.push(sp(loc, B::WriteRef));
         }
         C::Abort(ecode) => {
-            exp(context, code, ecode);
+            abort_code(context, code, ecode);
             code.push(sp(loc, B::Abort));
         }
         C::Return { exp: e, .. } => {
@@ -1072,4 +1073,27 @@ fn binary_op(code: &mut IR::BytecodeBlock, sp!(loc, op_): BinOp) {
             O::Range | O::Implies | O::Iff => panic!("specification operator unexpected"),
         },
     ));
+}
+
+fn abort_code(context: &mut Context, code: &mut IR::BytecodeBlock, ecode: H::Exp) {
+    use IR::Bytecode_ as B;
+    match ecode.exp {
+        sp!(cloc, H::UnannotatedExp_::Constant(nm))
+            if context.current_module().is_some_and(|m| {
+                context.constant_attributes(m, nm).is_some_and(|attrs| {
+                    attrs.contains_key_(&known_attributes::ErrorAttribute.into())
+                })
+            }) =>
+        {
+            let (_, line_no, _) = context.env.file_mapping().location(cloc);
+            code.push(sp(
+                cloc,
+                B::ErrorConstant {
+                    line_number: line_no as u16,
+                    constant: Some(context.constant_name(nm)),
+                },
+            ));
+        }
+        _ => exp(context, code, ecode),
+    }
 }

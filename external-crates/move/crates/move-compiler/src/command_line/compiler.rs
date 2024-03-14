@@ -348,6 +348,10 @@ impl<'a> Compiler<'a> {
             .iter_mut()
             .for_each(|(_, (path, _))| *path = relativize_path(&vfs_root, *path));
 
+        source_text.iter().for_each(|(fhash, (fname, contents))| {
+            compilation_env.add_source_file(*fhash, *fname, contents.clone())
+        });
+
         let res: Result<_, (Pass, Diagnostics)> =
             SteppedCompiler::new_at_parser(compilation_env, pre_compiled_lib, pprog)
                 .run::<TARGET>()
