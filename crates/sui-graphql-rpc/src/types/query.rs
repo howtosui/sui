@@ -3,17 +3,7 @@
 
 use std::str::FromStr;
 
-use crate::types::base64::Base64 as GraphQLBase64;
-use async_graphql::{connection::Connection, *};
-use fastcrypto::encoding::{Base64, Encoding};
-use move_core_types::account_address::AccountAddress;
-use serde::de::DeserializeOwned;
-use sui_json_rpc::name_service::NameServiceConfig;
-use sui_json_rpc_types::DevInspectArgs;
-use sui_sdk::SuiClient;
-use sui_types::transaction::{TransactionData, TransactionKind};
-use sui_types::{gas_coin::GAS, transaction::TransactionDataAPI, TypeTag};
-
+use super::object::ValidIntentScope;
 use super::suins_registration::NameService;
 use super::zklogin_verify_signature::{verify_zklogin_signature_inner, ZkLoginVerifyResult};
 use super::{
@@ -38,10 +28,20 @@ use super::{
     transaction_metadata::TransactionMetadata,
     type_filter::ExactTypeFilter,
 };
+use crate::types::base64::Base64 as GraphQLBase64;
 use crate::{
     config::ServiceConfig, context_data::db_data_provider::PgManager, data::Db, error::Error,
     mutation::Mutation,
 };
+use async_graphql::{connection::Connection, *};
+use fastcrypto::encoding::{Base64, Encoding};
+use move_core_types::account_address::AccountAddress;
+use serde::de::DeserializeOwned;
+use sui_json_rpc::name_service::NameServiceConfig;
+use sui_json_rpc_types::DevInspectArgs;
+use sui_sdk::SuiClient;
+use sui_types::transaction::{TransactionData, TransactionKind};
+use sui_types::{gas_coin::GAS, transaction::TransactionDataAPI, TypeTag};
 
 pub(crate) struct Query;
 pub(crate) type SuiGraphQLSchema = async_graphql::Schema<Query, Mutation, EmptySubscription>;
@@ -412,7 +412,7 @@ impl Query {
         ctx: &Context<'_>,
         bytes: GraphQLBase64,
         signature: GraphQLBase64,
-        intent_scope: u64,
+        intent_scope: ValidIntentScope,
         author: SuiAddress,
     ) -> Result<ZkLoginVerifyResult> {
         verify_zklogin_signature_inner(ctx.data_unchecked(), bytes, signature, intent_scope, author)

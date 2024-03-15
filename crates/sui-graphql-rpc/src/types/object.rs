@@ -204,6 +204,13 @@ pub(crate) struct HistoricalObjectCursor {
     checkpoint_viewed_at: u64,
 }
 
+#[derive(Enum, Copy, Clone, Eq, PartialEq)]
+#[graphql(name = "ValidIntentScope")]
+pub(crate) enum ValidIntentScope {
+    TransactionData,
+    PersonalMessage,
+}
+
 /// Interface implemented by on-chain values that are addressable by an ID (also referred to as its
 /// address). This includes Move objects and packages.
 #[derive(Interface)]
