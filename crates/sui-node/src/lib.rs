@@ -12,10 +12,10 @@ use arc_swap::ArcSwap;
 use fastcrypto_zkp::bn254::zk_login::JwkId;
 use fastcrypto_zkp::bn254::zk_login::OIDCProvider;
 use futures::TryFutureExt;
-use narwhal_worker::LazyNarwhalClient;
 use prometheus::Registry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 #[cfg(msim)]
@@ -25,16 +25,17 @@ use std::time::Duration;
 use sui_core::authority::RandomnessRoundReceiver;
 use sui_core::authority::CHAIN_IDENTIFIER;
 use sui_core::consensus_adapter::SubmitToConsensus;
+use sui_core::consensus_manager::ConsensusClient;
 use sui_core::epoch::randomness::RandomnessManager;
 use sui_core::execution_cache::ExecutionCacheMetrics;
 use sui_core::execution_cache::NotifyReadWrapper;
+use sui_core::traffic_controller::metrics::TrafficControllerMetrics;
+use sui_json_rpc::ServerType;
 use sui_json_rpc_api::JsonRpcMetrics;
 use sui_network::randomness;
-use sui_protocol_config::ProtocolVersion;
 use sui_types::base_types::ConciseableName;
 use sui_types::crypto::RandomnessRound;
 use sui_types::digests::ChainIdentifier;
-use sui_types::message_envelope::get_google_jwk_bytes;
 use sui_types::sui_system_state::SuiSystemState;
 use tap::tap::TapFallible;
 use tokio::runtime::Handle;
@@ -54,7 +55,7 @@ use narwhal_network::metrics::MetricsMakeCallbackHandler;
 use narwhal_network::metrics::{NetworkConnectionMetrics, NetworkMetrics};
 use sui_archival::reader::ArchiveReaderBalancer;
 use sui_archival::writer::ArchiveWriter;
-use sui_config::node::{ConsensusProtocol, DBCheckpointConfig, RunWithRange};
+use sui_config::node::{DBCheckpointConfig, RunWithRange};
 use sui_config::node_config_metrics::NodeConfigMetrics;
 use sui_config::object_storage_config::{ObjectStoreConfig, ObjectStoreType};
 use sui_config::{ConsensusConfig, NodeConfig};
@@ -206,7 +207,7 @@ use simulator::*;
 #[cfg(msim)]
 pub use simulator::set_jwk_injector;
 use sui_core::consensus_handler::ConsensusHandlerInitializer;
-use sui_core::mysticeti_adapter::LazyMysticetiClient;
+use sui_types::execution_config_utils::to_binary_config;
 
 pub struct SuiNode {
     config: NodeConfig,
@@ -580,7 +581,8 @@ impl SuiNode {
                 .await?;
 
         // Start uploading state snapshot to remote store
-        let state_snapshot_handle = Self::start_state_snapshot(&config, &prometheus_registry)?;
+        let state_snapshot_handle =
+            Self::start_state_snapshot(&config, &prometheus_registry, checkpoint_store.clone())?;
 
         // Start uploading db checkpoints to remote store
         let (db_checkpoint_config, db_checkpoint_handle) = Self::start_db_checkpoint(
@@ -603,21 +605,16 @@ impl SuiNode {
             secret,
             config.supported_protocol_versions.unwrap(),
             store.clone(),
-            execution_cache,
+            execution_cache.clone(),
             epoch_store.clone(),
             committee_store.clone(),
             index_store.clone(),
             checkpoint_store.clone(),
             &prometheus_registry,
-            pruning_config,
             genesis.objects(),
             &db_checkpoint_config,
-            config.expensive_safety_check_config.clone(),
-            config.transaction_deny_config.clone(),
-            config.certificate_deny_config.clone(),
+            config.clone(),
             config.indirect_objects_threshold,
-            config.state_debug_dump_config.clone(),
-            config.authority_overload_config.clone(),
             archive_readers,
         )
         .await;
@@ -638,6 +635,10 @@ impl SuiNode {
                 .await
                 .unwrap();
         }
+
+        checkpoint_store
+            .reexecute_local_checkpoints(&state, &epoch_store)
+            .await;
 
         // Start the loop that receives new randomness and generates transactions for it.
         RandomnessRoundReceiver::spawn(state.clone(), randomness_rx);
@@ -679,9 +680,10 @@ impl SuiNode {
             &prometheus_registry,
             custom_rpc_runtime,
             software_version,
-        )?;
+        )
+        .await?;
 
-        let accumulator = Arc::new(StateAccumulator::new(store));
+        let accumulator = Arc::new(StateAccumulator::new(execution_cache));
 
         let authority_names_to_peer_ids = epoch_store
             .epoch_start_state()
@@ -855,6 +857,7 @@ impl SuiNode {
     fn start_state_snapshot(
         config: &NodeConfig,
         prometheus_registry: &Registry,
+        checkpoint_store: Arc<CheckpointStore>,
     ) -> Result<Option<tokio::sync::broadcast::Sender<()>>> {
         if let Some(remote_store_config) = &config.state_snapshot_write_config.object_store_config {
             let snapshot_uploader = StateSnapshotUploader::new(
@@ -863,6 +866,7 @@ impl SuiNode {
                 remote_store_config.clone(),
                 60,
                 prometheus_registry,
+                checkpoint_store,
             )?;
             Ok(Some(snapshot_uploader.start()))
         } else {
@@ -1015,6 +1019,12 @@ impl SuiNode {
 
             // Set high-performance defaults for quinn transport.
             // With 200MiB buffer size and ~500ms RTT, max throughput ~400MiB/s.
+            if quic_config.max_concurrent_bidi_streams.is_none() {
+                quic_config.max_concurrent_bidi_streams = Some(500);
+            }
+            if quic_config.max_concurrent_uni_streams.is_none() {
+                quic_config.max_concurrent_uni_streams = Some(500);
+            }
             if quic_config.stream_receive_window.is_none() {
                 quic_config.stream_receive_window = Some(100 << 20);
             }
@@ -1082,70 +1092,18 @@ impl SuiNode {
             .as_mut()
             .ok_or_else(|| anyhow!("Validator is missing consensus config"))?;
 
-        // Only allow overriding the consensus protocol, if the protocol version supports
-        // fields needed by Mysticeti.
-        if epoch_store.protocol_config().version >= ProtocolVersion::new(36) {
-            if let Ok(consensus_choice) = std::env::var("CONSENSUS") {
-                let consensus_protocol = match consensus_choice.as_str() {
-                    "narwhal" => ConsensusProtocol::Narwhal,
-                    "mysticeti" => ConsensusProtocol::Mysticeti,
-                    "swap_each_epoch" => {
-                        if epoch_store.epoch() % 2 == 0 {
-                            ConsensusProtocol::Narwhal
-                        } else {
-                            ConsensusProtocol::Mysticeti
-                        }
-                    }
-                    _ => {
-                        let consensus = consensus_config.protocol.clone();
-                        warn!("Consensus env var was set to an invalid choice, using default consensus protocol {consensus:?}");
-                        consensus
-                    }
-                };
-                info!("Constructing consensus protocol {consensus_protocol:?}...");
-                consensus_config.protocol = consensus_protocol;
-            }
-        }
-
-        // TODO (mysticeti): Move protocol choice to a protocol config flag.
-        let (consensus_adapter, consensus_manager) = match consensus_config.protocol {
-            ConsensusProtocol::Narwhal => {
-                let consensus_adapter = Arc::new(Self::construct_consensus_adapter(
-                    &committee,
-                    consensus_config,
-                    state.name,
-                    connection_monitor_status.clone(),
-                    &registry_service.default_registry(),
-                    epoch_store.protocol_config().clone(),
-                    Arc::new(LazyNarwhalClient::new(
-                        consensus_config.address().to_owned(),
-                    )),
-                ));
-                let consensus_manager =
-                    ConsensusManager::new_narwhal(&config, consensus_config, registry_service);
-                (consensus_adapter, consensus_manager)
-            }
-            ConsensusProtocol::Mysticeti => {
-                let client = Arc::new(LazyMysticetiClient::new());
-
-                let consensus_adapter = Arc::new(Self::construct_consensus_adapter(
-                    &committee,
-                    consensus_config,
-                    state.name,
-                    connection_monitor_status.clone(),
-                    &registry_service.default_registry(),
-                    epoch_store.protocol_config().clone(),
-                    client.clone(),
-                ));
-                let consensus_manager = ConsensusManager::new_mysticeti(
-                    &config,
-                    consensus_config,
-                    registry_service,
-                    client,
-                );
-                (consensus_adapter, consensus_manager)
-            }
-        };
+        let client = Arc::new(ConsensusClient::new());
+        let consensus_adapter = Arc::new(Self::construct_consensus_adapter(
+            &committee,
+            consensus_config,
+            state.name,
+            connection_monitor_status.clone(),
+            &registry_service.default_registry(),
+            epoch_store.protocol_config().clone(),
+            client.clone(),
+        ));
+        let consensus_manager =
+            ConsensusManager::new(&config, consensus_config, registry_service, client);
 
         let mut consensus_epoch_data_remover =
             EpochDataRemover::new(consensus_manager.get_storage_base_path());
@@ -1245,10 +1203,9 @@ impl SuiNode {
                 randomness_handle,
                 config.protocol_key_pair(),
             )
-            .await
-            .map(Arc::new);
-            if let Some(randomness_manager) = &randomness_manager {
-                epoch_store.set_randomness_manager(randomness_manager.clone())?;
+            .await;
+            if let Some(randomness_manager) = randomness_manager {
+                epoch_store.set_randomness_manager(randomness_manager)?;
             }
         }
 
@@ -1395,6 +1352,9 @@ impl SuiNode {
             state.clone(),
             consensus_adapter,
             Arc::new(ValidatorServiceMetrics::new(prometheus_registry)),
+            TrafficControllerMetrics::new(prometheus_registry),
+            config.policy_config.clone(),
+            config.firewall_config.clone(),
         );
 
         let mut server_conf = mysten_network::config::Config::new();
@@ -1454,13 +1414,6 @@ impl SuiNode {
         self.transaction_orchestrator.clone()
     }
 
-    pub fn get_google_jwk_bytes(&self) -> Result<Vec<u8>, SuiError> {
-        Ok(get_google_jwk_bytes()
-            .read()
-            .map_err(|_| SuiError::JWKRetrievalError)?
-            .to_vec())
-    }
-
     pub fn subscribe_to_transaction_orchestrator_effects(
         &self,
     ) -> Result<tokio::sync::broadcast::Receiver<QuorumDriverEffectsQueueResult>> {
@@ -1492,8 +1445,7 @@ impl SuiNode {
                 tokio::time::sleep(Duration::from_millis(1)).await;
 
                 let config = cur_epoch_store.protocol_config();
-                let max_binary_format_version = config.move_binary_format_version();
-                let no_extraneous_module_bytes = config.no_extraneous_module_bytes();
+                let binary_config = to_binary_config(config);
                 let transaction =
                     ConsensusTransaction::new_capability_notification(AuthorityCapabilities::new(
                         self.state.name,
@@ -1501,10 +1453,7 @@ impl SuiNode {
                             .supported_protocol_versions
                             .expect("Supported versions should be populated"),
                         self.state
-                            .get_available_system_packages(
-                                max_binary_format_version,
-                                no_extraneous_module_bytes,
-                            )
+                            .get_available_system_packages(&binary_config)
                             .await,
                     ));
                 info!(?transaction, "submitting capabilities to consensus");
@@ -1857,7 +1806,7 @@ fn build_kv_store(
     )))
 }
 
-pub fn build_http_server(
+pub async fn build_http_server(
     state: Arc<AuthorityState>,
     store: RocksDbStore,
     transaction_orchestrator: &Option<Arc<TransactiondOrchestrator<NetworkAuthorityClient>>>,
@@ -1876,7 +1825,12 @@ pub fn build_http_server(
     let mut router = axum::Router::new();
 
     let json_rpc_router = {
-        let mut server = JsonRpcServerBuilder::new(env!("CARGO_PKG_VERSION"), prometheus_registry);
+        let mut server = JsonRpcServerBuilder::new(
+            env!("CARGO_PKG_VERSION"),
+            prometheus_registry,
+            config.policy_config.clone(),
+            config.firewall_config.clone(),
+        );
 
         let kv_store = build_kv_store(&state, config, prometheus_registry)?;
 
@@ -1932,7 +1886,12 @@ pub fn build_http_server(
         ))?;
         server.register_module(MoveUtils::new(state))?;
 
-        server.to_router(None)?
+        let server_type = if config.websocket_only {
+            Some(ServerType::WebSocket)
+        } else {
+            None
+        };
+        server.to_router(server_type).await?
     };
 
     router = router.merge(json_rpc_router);
@@ -1944,7 +1903,8 @@ pub fn build_http_server(
         router = router.nest("/rest", rest_router);
     }
 
-    let server = axum::Server::bind(&config.json_rpc_address).serve(router.into_make_service());
+    let server = axum::Server::bind(&config.json_rpc_address)
+        .serve(router.into_make_service_with_connect_info::<SocketAddr>());
 
     let addr = server.local_addr();
     let handle = tokio::spawn(async move { server.await.unwrap() });

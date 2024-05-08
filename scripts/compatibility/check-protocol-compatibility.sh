@@ -42,9 +42,14 @@ echo "Using most frequent version $TOP_VERSION for compatibility check"
 # TOP_VERSION looks like "1.0.0-ae1212baf8", split out the commit hash
 ORIGIN_COMMIT=$(echo "$TOP_VERSION" | cut -d- -f2)
 
-echo "Checking protocol compatibility with $NETWORK ($ORIGIN_COMMIT)"
-
 git fetch -q || exit 1
+SOURCE_COMMIT=$(git rev-parse HEAD)
+SOURCE_BRANCH=$(git branch -a --contains "$SOURCE_COMMIT" | head -n 1 | cut -d' ' -f2-)
+
+echo "Source commit: $SOURCE_COMMIT"
+echo "Source branch: $SOURCE_BRANCH"
+
+echo "Checking protocol compatibility with $NETWORK ($ORIGIN_COMMIT)"
 
 # put code to check if git client is clean into function
 function check_git_clean {

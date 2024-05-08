@@ -7,10 +7,10 @@ pub use checked::*;
 mod checked {
     use crate::gas_charger::GasCharger;
     use move_binary_format::{
-        access::ModuleAccess,
         compatibility::{Compatibility, InclusionCheck},
         errors::{Location, PartialVMResult, VMResult},
         file_format::{AbilitySet, CodeOffset, FunctionDefinitionIndex, LocalIndex, Visibility},
+        file_format_common::VERSION_6,
         normalized, CompiledModule,
     };
     use move_core_types::{
@@ -32,6 +32,7 @@ mod checked {
     };
     use sui_move_natives::object_runtime::ObjectRuntime;
     use sui_protocol_config::ProtocolConfig;
+    use sui_types::execution_config_utils::to_binary_config;
     use sui_types::storage::{get_package_objects, PackageObject};
     use sui_types::{
         base_types::{
@@ -58,7 +59,6 @@ mod checked {
         execution_status::{CommandArgumentError, PackageUpgradeError},
     };
     use sui_verifier::{
-        default_verifier_config,
         private_generics::{EVENT_MODULE, PRIVATE_TRANSFER_FUNCTIONS, TRANSFER_MODULE},
         INIT_FN_NAME,
     };
@@ -641,10 +641,8 @@ mod checked {
             ));
         };
 
-        let Ok(current_normalized) = existing_package.normalize(
-            context.protocol_config.move_binary_format_version(),
-            context.protocol_config.no_extraneous_module_bytes(),
-        ) else {
+        let binary_config = to_binary_config(context.protocol_config);
+        let Ok(current_normalized) = existing_package.normalize(&binary_config) else {
             invariant_violation!("Tried to normalize modules in existing package but failed")
         };
 
@@ -795,15 +793,12 @@ mod checked {
         context: &mut ExecutionContext<'_, '_, '_>,
         module_bytes: &[Vec<u8>],
     ) -> Result<Vec<CompiledModule>, ExecutionError> {
+        let binary_config = to_binary_config(context.protocol_config);
         let modules = module_bytes
             .iter()
             .map(|b| {
-                CompiledModule::deserialize_with_config(
-                    b,
-                    context.protocol_config.move_binary_format_version(),
-                    context.protocol_config.no_extraneous_module_bytes(),
-                )
-                .map_err(|e| e.finish(Location::Undefined))
+                CompiledModule::deserialize_with_config(b, &binary_config)
+                    .map_err(|e| e.finish(Location::Undefined))
             })
             .collect::<VMResult<Vec<CompiledModule>>>()
             .map_err(|e| context.convert_vm_error(e))?;
@@ -822,11 +817,17 @@ mod checked {
         modules: &[CompiledModule],
     ) -> Result<(), ExecutionError> {
         // TODO(https://github.com/MystenLabs/sui/issues/69): avoid this redundant serialization by exposing VM API that allows us to run the linker directly on `Vec<CompiledModule>`
+        let binary_version = context.protocol_config.move_binary_format_version();
         let new_module_bytes: Vec<_> = modules
             .iter()
             .map(|m| {
                 let mut bytes = Vec::new();
-                m.serialize(&mut bytes).unwrap();
+                let version = if binary_version > VERSION_6 {
+                    m.version
+                } else {
+                    VERSION_6
+                };
+                m.serialize_with_version(version, &mut bytes).unwrap();
                 bytes
             })
             .collect();
@@ -841,7 +842,9 @@ mod checked {
             sui_verifier::verifier::sui_verify_module_unmetered(
                 module,
                 &BTreeMap::new(),
-                &default_verifier_config(context.protocol_config, false),
+                &context
+                    .protocol_config
+                    .verifier_config(/* for_signing */ false),
             )?;
         }
 
@@ -1086,7 +1089,7 @@ mod checked {
                     Type::TyParam(_) => {
                         invariant_violation!("TyParam should have been substituted")
                     }
-                    Type::Struct(_) | Type::StructInstantiation(_, _) if abilities.has_key() => {
+                    Type::Struct(_) | Type::StructInstantiation(_) if abilities.has_key() => {
                         let type_tag = context
                             .vm
                             .get_runtime()
@@ -1101,7 +1104,7 @@ mod checked {
                         }
                     }
                     Type::Struct(_)
-                    | Type::StructInstantiation(_, _)
+                    | Type::StructInstantiation(_)
                     | Type::Bool
                     | Type::U8
                     | Type::U64
@@ -1334,12 +1337,13 @@ mod checked {
                 }
 
                 // Now make sure the param type is a struct instantiation of the receiving struct
-                let Type::StructInstantiation(sidx, targs) = param_ty else {
+                let Type::StructInstantiation(struct_inst) = param_ty else {
                     return Err(command_argument_error(
                         CommandArgumentError::TypeMismatch,
                         idx,
                     ));
                 };
+                let (sidx, targs) = &**struct_inst;
                 let Some(s) = context.vm.get_runtime().get_struct_type(*sidx) else {
                     invariant_violation!("sui::transfer::Receiving struct not found in session")
                 };
@@ -1422,7 +1426,8 @@ mod checked {
                 let info_opt = primitive_serialization_layout(context, inner)?;
                 info_opt.map(|layout| PrimitiveArgumentLayout::Vector(Box::new(layout)))
             }
-            Type::StructInstantiation(idx, targs) => {
+            Type::StructInstantiation(struct_inst) => {
+                let (idx, targs) = &**struct_inst;
                 let Some(s) = context.vm.get_runtime().get_struct_type(*idx) else {
                     invariant_violation!("Loaded struct not found")
                 };
