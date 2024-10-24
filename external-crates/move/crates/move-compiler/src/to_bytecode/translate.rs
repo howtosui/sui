@@ -238,6 +238,7 @@ fn module(
     let function_infos = module_function_infos(&module, &source_map, &collected_function_infos);
     let module = NamedCompiledModule {
         package_name: mdef.package_name,
+        address_name: addr_name,
         address: addr_bytes,
         name: module_name.value(),
         module,
@@ -246,7 +247,6 @@ fn module(
     Some(AnnotatedCompiledModule {
         loc: ident_loc,
         attributes,
-        address_name: addr_name,
         module_name_loc: module_name.loc(),
         named_module: module,
         function_infos,
@@ -811,11 +811,11 @@ fn base_types(context: &mut Context, bs: Vec<H::BaseType>) -> Vec<IR::Type> {
     bs.into_iter().map(|b| base_type(context, b)).collect()
 }
 
-fn base_type(context: &mut Context, sp!(_, bt_): H::BaseType) -> IR::Type {
+fn base_type(context: &mut Context, sp!(bt_loc, bt_): H::BaseType) -> IR::Type {
     use BuiltinTypeName_ as BT;
     use H::{BaseType_ as B, TypeName_ as TN};
-    use IR::Type as IRT;
-    match bt_ {
+    use IR::Type_ as IRT;
+    let type_ = match bt_ {
         B::Unreachable | B::UnresolvedError => {
             panic!("ICE should not have reached compilation if there are errors")
         }
@@ -845,15 +845,19 @@ fn base_type(context: &mut Context, sp!(_, bt_): H::BaseType) -> IR::Type {
             user_specified_name,
             ..
         }) => IRT::TypeParameter(type_var(user_specified_name).value),
-    }
+    };
+    sp(bt_loc, type_)
 }
 
-fn single_type(context: &mut Context, sp!(_, st_): H::SingleType) -> IR::Type {
+fn single_type(context: &mut Context, sp!(st_loc, st_): H::SingleType) -> IR::Type {
     use H::SingleType_ as S;
-    use IR::Type as IRT;
+    use IR::Type_ as IRT;
     match st_ {
         S::Base(bt) => base_type(context, bt),
-        S::Ref(mut_, bt) => IRT::Reference(mut_, Box::new(base_type(context, bt))),
+        S::Ref(mut_, bt) => sp(
+            st_loc,
+            IRT::Reference(mut_, Box::new(base_type(context, bt))),
+        ),
     }
 }
 
@@ -887,7 +891,7 @@ fn command(context: &mut Context, code: &mut IR::BytecodeBlock, sp!(loc, cmd_): 
             exp(context, code, *eref);
             code.push(sp(loc, B::WriteRef));
         }
-        C::Abort(ecode) => {
+        C::Abort(_, ecode) => {
             exp(context, code, ecode);
             code.push(sp(loc, B::Abort));
         }
@@ -1061,10 +1065,9 @@ fn exp(context: &mut Context, code: &mut IR::BytecodeBlock, e: H::Exp) {
         } => {
             let line_no = context
                 .env
-                .file_mapping()
-                .location(line_number_loc)
-                .start
-                .line;
+                .mapped_files()
+                .start_position(&line_number_loc)
+                .user_line();
 
             // Clamp line number to u16::MAX -- so if the line number exceeds u16::MAX, we don't
             // record the line number essentially.

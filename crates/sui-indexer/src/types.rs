@@ -1,8 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::errors::IndexerError;
 use move_core_types::language_storage::StructTag;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use sui_json_rpc_types::{
@@ -12,22 +12,24 @@ use sui_types::base_types::{ObjectDigest, SequenceNumber};
 use sui_types::base_types::{ObjectID, SuiAddress};
 use sui_types::crypto::AggregateAuthoritySignature;
 use sui_types::digests::TransactionDigest;
-use sui_types::dynamic_field::DynamicFieldInfo;
+use sui_types::dynamic_field::DynamicFieldType;
 use sui_types::effects::TransactionEffects;
-use sui_types::event::SystemEpochInfoEvent;
 use sui_types::messages_checkpoint::{
-    CertifiedCheckpointSummary, CheckpointCommitment, CheckpointDigest, EndOfEpochData,
+    CertifiedCheckpointSummary, CheckpointCommitment, CheckpointContents, CheckpointDigest,
+    CheckpointSequenceNumber, EndOfEpochData,
 };
 use sui_types::move_package::MovePackage;
 use sui_types::object::{Object, Owner};
 use sui_types::sui_serde::SuiStructTag;
-use sui_types::sui_system_state::sui_system_state_summary::SuiSystemStateSummary;
 use sui_types::transaction::SenderSignedData;
+
+use crate::errors::IndexerError;
 
 pub type IndexerResult<T> = Result<T, IndexerError>;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct IndexedCheckpoint {
+    // TODO: A lot of fields are now redundant with certified_checkpoint and checkpoint_contents.
     pub sequence_number: u64,
     pub checkpoint_digest: CheckpointDigest,
     pub epoch: u64,
@@ -45,18 +47,26 @@ pub struct IndexedCheckpoint {
     pub successful_tx_num: usize,
     pub end_of_epoch_data: Option<EndOfEpochData>,
     pub end_of_epoch: bool,
+    pub min_tx_sequence_number: u64,
+    pub max_tx_sequence_number: u64,
+    // FIXME: Remove the Default derive and make these fields mandatory.
+    pub certified_checkpoint: Option<CertifiedCheckpointSummary>,
+    pub checkpoint_contents: Option<CheckpointContents>,
 }
 
 impl IndexedCheckpoint {
     pub fn from_sui_checkpoint(
-        checkpoint: &sui_types::messages_checkpoint::CertifiedCheckpointSummary,
-        contents: &sui_types::messages_checkpoint::CheckpointContents,
+        checkpoint: &CertifiedCheckpointSummary,
+        contents: &CheckpointContents,
         successful_tx_num: usize,
     ) -> Self {
         let total_gas_cost = checkpoint.epoch_rolling_gas_cost_summary.computation_cost as i64
             + checkpoint.epoch_rolling_gas_cost_summary.storage_cost as i64
             - checkpoint.epoch_rolling_gas_cost_summary.storage_rebate as i64;
         let tx_digests = contents.iter().map(|t| t.transaction).collect::<Vec<_>>();
+        let max_tx_sequence_number = checkpoint.network_total_transactions - 1;
+        // NOTE: + 1u64 first to avoid subtraction with overflow
+        let min_tx_sequence_number = max_tx_sequence_number + 1u64 - tx_digests.len() as u64;
         let auth_sig = &checkpoint.auth_sig().signature;
         Self {
             sequence_number: checkpoint.sequence_number,
@@ -78,89 +88,10 @@ impl IndexedCheckpoint {
             timestamp_ms: checkpoint.timestamp_ms,
             validator_signature: auth_sig.clone(),
             checkpoint_commitments: checkpoint.checkpoint_commitments.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct IndexedEpochInfo {
-    pub epoch: u64,
-    pub first_checkpoint_id: u64,
-    pub epoch_start_timestamp: u64,
-    pub reference_gas_price: u64,
-    pub protocol_version: u64,
-    pub total_stake: u64,
-    pub storage_fund_balance: u64,
-    pub system_state: Vec<u8>,
-    pub epoch_total_transactions: Option<u64>,
-    pub last_checkpoint_id: Option<u64>,
-    pub epoch_end_timestamp: Option<u64>,
-    pub storage_fund_reinvestment: Option<u64>,
-    pub storage_charge: Option<u64>,
-    pub storage_rebate: Option<u64>,
-    pub stake_subsidy_amount: Option<u64>,
-    pub total_gas_fees: Option<u64>,
-    pub total_stake_rewards_distributed: Option<u64>,
-    pub leftover_storage_fund_inflow: Option<u64>,
-    pub epoch_commitments: Option<Vec<CheckpointCommitment>>,
-}
-
-impl IndexedEpochInfo {
-    pub fn from_new_system_state_summary(
-        new_system_state_summary: SuiSystemStateSummary,
-        first_checkpoint_id: u64,
-        event: Option<&SystemEpochInfoEvent>,
-    ) -> IndexedEpochInfo {
-        Self {
-            epoch: new_system_state_summary.epoch,
-            first_checkpoint_id,
-            epoch_start_timestamp: new_system_state_summary.epoch_start_timestamp_ms,
-            reference_gas_price: new_system_state_summary.reference_gas_price,
-            protocol_version: new_system_state_summary.protocol_version,
-            // NOTE: total_stake and storage_fund_balance are about new epoch,
-            // although the event is generated at the end of the previous epoch,
-            // the event is optional b/c no such event for the first epoch.
-            total_stake: event.map(|e| e.total_stake).unwrap_or(0),
-            storage_fund_balance: event.map(|e| e.storage_fund_balance).unwrap_or(0),
-            system_state: bcs::to_bytes(&new_system_state_summary).unwrap(),
-            ..Default::default()
-        }
-    }
-
-    pub fn from_end_of_epoch_data(
-        system_state_summary: &SuiSystemStateSummary,
-        last_checkpoint_summary: &CertifiedCheckpointSummary,
-        event: &SystemEpochInfoEvent,
-        network_total_tx_num_at_last_epoch_end: u64,
-    ) -> IndexedEpochInfo {
-        Self {
-            epoch: last_checkpoint_summary.epoch,
-            epoch_total_transactions: Some(
-                last_checkpoint_summary.network_total_transactions
-                    - network_total_tx_num_at_last_epoch_end,
-            ),
-            last_checkpoint_id: Some(*last_checkpoint_summary.sequence_number()),
-            epoch_end_timestamp: Some(last_checkpoint_summary.timestamp_ms),
-            storage_fund_reinvestment: Some(event.storage_fund_reinvestment),
-            storage_charge: Some(event.storage_charge),
-            storage_rebate: Some(event.storage_rebate),
-            leftover_storage_fund_inflow: Some(event.leftover_storage_fund_inflow),
-            stake_subsidy_amount: Some(event.stake_subsidy_amount),
-            total_gas_fees: Some(event.total_gas_fees),
-            total_stake_rewards_distributed: Some(event.total_stake_rewards_distributed),
-            epoch_commitments: last_checkpoint_summary
-                .end_of_epoch_data
-                .as_ref()
-                .map(|e| e.epoch_commitments.clone()),
-            system_state: bcs::to_bytes(system_state_summary).unwrap(),
-            // The following felds will not and shall not be upserted
-            // into DB. We have them below to make compiler and diesel happy
-            first_checkpoint_id: 0,
-            epoch_start_timestamp: 0,
-            reference_gas_price: 0,
-            protocol_version: 0,
-            total_stake: 0,
-            storage_fund_balance: 0,
+            min_tx_sequence_number,
+            max_tx_sequence_number,
+            certified_checkpoint: Some(checkpoint.clone()),
+            checkpoint_contents: Some(contents.clone()),
         }
     }
 }
@@ -171,7 +102,7 @@ pub struct IndexedEvent {
     pub event_sequence_number: u64,
     pub checkpoint_sequence_number: u64,
     pub transaction_digest: TransactionDigest,
-    pub senders: Vec<SuiAddress>,
+    pub sender: SuiAddress,
     pub package: ObjectID,
     pub module: String,
     pub event_type: String,
@@ -197,7 +128,7 @@ impl IndexedEvent {
             event_sequence_number,
             checkpoint_sequence_number,
             transaction_digest,
-            senders: vec![event.sender],
+            sender: event.sender,
             package: event.package_id,
             module: event.transaction_module.to_string(),
             event_type: event.type_.to_canonical_string(/* with_prefix */ true),
@@ -206,6 +137,65 @@ impl IndexedEvent {
             event_type_name: event.type_.name.to_string(),
             bcs: event.contents.clone(),
             timestamp_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EventIndex {
+    pub tx_sequence_number: u64,
+    pub event_sequence_number: u64,
+    pub sender: SuiAddress,
+    pub emit_package: ObjectID,
+    pub emit_module: String,
+    pub type_package: ObjectID,
+    pub type_module: String,
+    /// Struct name of the event, without type parameters.
+    pub type_name: String,
+    /// Type instantiation of the event, with type name and type parameters, if any.
+    pub type_instantiation: String,
+}
+
+// for ingestion test
+impl EventIndex {
+    pub fn random() -> Self {
+        let mut rng = rand::thread_rng();
+        EventIndex {
+            tx_sequence_number: rng.gen(),
+            event_sequence_number: rng.gen(),
+            sender: SuiAddress::random_for_testing_only(),
+            emit_package: ObjectID::random(),
+            emit_module: rng.gen::<u64>().to_string(),
+            type_package: ObjectID::random(),
+            type_module: rng.gen::<u64>().to_string(),
+            type_name: rng.gen::<u64>().to_string(),
+            type_instantiation: rng.gen::<u64>().to_string(),
+        }
+    }
+}
+
+impl EventIndex {
+    pub fn from_event(
+        tx_sequence_number: u64,
+        event_sequence_number: u64,
+        event: &sui_types::event::Event,
+    ) -> Self {
+        let type_instantiation = event
+            .type_
+            .to_canonical_string(/* with_prefix */ true)
+            .splitn(3, "::")
+            .collect::<Vec<_>>()[2]
+            .to_string();
+        Self {
+            tx_sequence_number,
+            event_sequence_number,
+            sender: event.sender,
+            emit_package: event.package_id,
+            emit_module: event.transaction_module.to_string(),
+            type_package: event.type_.address.into(),
+            type_module: event.type_.module.to_string(),
+            type_name: event.type_.name.to_string(),
+            type_instantiation,
         }
     }
 }
@@ -275,45 +265,40 @@ pub enum DynamicFieldKind {
 
 #[derive(Clone, Debug)]
 pub struct IndexedObject {
-    pub object_id: ObjectID,
-    pub object_version: u64,
-    pub object_digest: ObjectDigest,
-    pub checkpoint_sequence_number: u64,
-    pub owner_type: OwnerType,
-    pub owner_id: Option<SuiAddress>,
+    pub checkpoint_sequence_number: CheckpointSequenceNumber,
     pub object: Object,
-    pub coin_type: Option<String>,
-    pub coin_balance: Option<u64>,
-    pub df_info: Option<DynamicFieldInfo>,
+    pub df_kind: Option<DynamicFieldType>,
+}
+
+impl IndexedObject {
+    pub fn random() -> Self {
+        let mut rng = rand::thread_rng();
+        let random_address = SuiAddress::random_for_testing_only();
+        IndexedObject {
+            checkpoint_sequence_number: rng.gen(),
+            object: Object::with_owner_for_testing(random_address),
+            df_kind: {
+                let random_value = rng.gen_range(0..3);
+                match random_value {
+                    0 => Some(DynamicFieldType::DynamicField),
+                    1 => Some(DynamicFieldType::DynamicObject),
+                    _ => None,
+                }
+            },
+        }
+    }
 }
 
 impl IndexedObject {
     pub fn from_object(
-        checkpoint_sequence_number: u64,
+        checkpoint_sequence_number: CheckpointSequenceNumber,
         object: Object,
-        df_info: Option<DynamicFieldInfo>,
+        df_kind: Option<DynamicFieldType>,
     ) -> Self {
-        let (owner_type, owner_id) = owner_to_owner_info(&object.owner);
-        let coin_type = object
-            .coin_type_maybe()
-            .map(|t| t.to_canonical_string(/* with_prefix */ true));
-        let coin_balance = if coin_type.is_some() {
-            Some(object.get_coin_value_unsafe())
-        } else {
-            None
-        };
-
         Self {
             checkpoint_sequence_number,
-            object_id: object.id(),
-            object_version: object.version().value(),
-            object_digest: object.digest(),
-            owner_type,
-            owner_id,
             object,
-            coin_type,
-            coin_balance,
-            df_info,
+            df_kind,
         }
     }
 }
@@ -323,6 +308,17 @@ pub struct IndexedDeletedObject {
     pub object_id: ObjectID,
     pub object_version: u64,
     pub checkpoint_sequence_number: u64,
+}
+
+impl IndexedDeletedObject {
+    pub fn random() -> Self {
+        let mut rng = rand::thread_rng();
+        IndexedDeletedObject {
+            object_id: ObjectID::random(),
+            object_version: rng.gen(),
+            checkpoint_sequence_number: rng.gen(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -356,14 +352,51 @@ pub struct IndexedTransaction {
 #[derive(Debug, Clone)]
 pub struct TxIndex {
     pub tx_sequence_number: u64,
+    pub tx_kind: TransactionKind,
     pub transaction_digest: TransactionDigest,
     pub checkpoint_sequence_number: u64,
     pub input_objects: Vec<ObjectID>,
     pub changed_objects: Vec<ObjectID>,
+    pub affected_objects: Vec<ObjectID>,
     pub payers: Vec<SuiAddress>,
-    pub senders: Vec<SuiAddress>,
+    pub sender: SuiAddress,
     pub recipients: Vec<SuiAddress>,
     pub move_calls: Vec<(ObjectID, String, String)>,
+}
+
+impl TxIndex {
+    pub fn random() -> Self {
+        let mut rng = rand::thread_rng();
+        TxIndex {
+            tx_sequence_number: rng.gen(),
+            tx_kind: if rng.gen_bool(0.5) {
+                TransactionKind::SystemTransaction
+            } else {
+                TransactionKind::ProgrammableTransaction
+            },
+            transaction_digest: TransactionDigest::random(),
+            checkpoint_sequence_number: rng.gen(),
+            input_objects: (0..1000).map(|_| ObjectID::random()).collect(),
+            changed_objects: (0..1000).map(|_| ObjectID::random()).collect(),
+            affected_objects: (0..1000).map(|_| ObjectID::random()).collect(),
+            payers: (0..rng.gen_range(0..100))
+                .map(|_| SuiAddress::random_for_testing_only())
+                .collect(),
+            sender: SuiAddress::random_for_testing_only(),
+            recipients: (0..rng.gen_range(0..1000))
+                .map(|_| SuiAddress::random_for_testing_only())
+                .collect(),
+            move_calls: (0..rng.gen_range(0..1000))
+                .map(|_| {
+                    (
+                        ObjectID::random(),
+                        rng.gen::<u64>().to_string(),
+                        rng.gen::<u64>().to_string(),
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 // ObjectChange is not bcs deserializable, IndexedObjectChange is.

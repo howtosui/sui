@@ -360,6 +360,7 @@ mod recolor_struct {
         pub fn add_lvalue(&mut self, sp!(_, lvalue_): &N::LValue) {
             match lvalue_ {
                 N::LValue_::Ignore => (),
+                N::LValue_::Error => (),
                 N::LValue_::Var { var, .. } => {
                     self.vars.insert(*var);
                 }
@@ -507,6 +508,7 @@ fn recolor_lvalues(ctx: &mut Recolor, lvalues: &mut N::LValueList) {
 fn recolor_lvalue(ctx: &mut Recolor, sp!(_, lvalue_): &mut N::LValue) {
     match lvalue_ {
         N::LValue_::Ignore => (),
+        N::LValue_::Error => (),
         N::LValue_::Var { var, .. } => recolor_var(ctx, var),
         N::LValue_::Unpack(_, _, _, lvalues) => {
             for (_, _, (_, lvalue)) in lvalues {
@@ -549,10 +551,12 @@ fn recolor_exp(ctx: &mut Recolor, sp!(_, e_): &mut N::Exp) {
             recolor_lvalues(ctx, lvalues);
             recolor_exp(ctx, e)
         }
-        N::Exp_::IfElse(econd, et, ef) => {
+        N::Exp_::IfElse(econd, et, ef_opt) => {
             recolor_exp(ctx, econd);
             recolor_exp(ctx, et);
-            recolor_exp(ctx, ef);
+            if let Some(ef) = ef_opt {
+                recolor_exp(ctx, ef);
+            }
         }
         N::Exp_::Match(subject, arms) => {
             recolor_exp(ctx, subject);
@@ -785,6 +789,7 @@ fn lvalues(context: &mut Context, sp!(_, lvs_): &mut N::LValueList) {
 fn lvalue(context: &mut Context, sp!(_, lv_): &mut N::LValue) {
     match lv_ {
         N::LValue_::Ignore => (),
+        N::LValue_::Error => (),
         N::LValue_::Var {
             var: sp!(_, v_), ..
         } => {
@@ -830,10 +835,12 @@ fn exp(context: &mut Context, sp!(eloc, e_): &mut N::Exp) {
             lvalues(context, lvs);
             exp(context, e)
         }
-        N::Exp_::IfElse(econd, et, ef) => {
+        N::Exp_::IfElse(econd, et, ef_opt) => {
             exp(context, econd);
             exp(context, et);
-            exp(context, ef);
+            if let Some(ef) = ef_opt {
+                exp(context, ef)
+            }
         }
         N::Exp_::Match(subject, arms) => {
             macro_rules! take_and_mut_replace {

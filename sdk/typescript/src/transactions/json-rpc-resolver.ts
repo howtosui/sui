@@ -148,8 +148,8 @@ async function resolveObjectReferences(
 	// We keep the input by-reference to avoid needing to re-resolve it:
 	const objectsToResolve = transactionData.inputs.filter((input) => {
 		return (
-			(input.UnresolvedObject && !input.UnresolvedObject.version) ||
-			input.UnresolvedObject?.initialSharedVersion
+			input.UnresolvedObject &&
+			!(input.UnresolvedObject.version || input.UnresolvedObject?.initialSharedVersion)
 		);
 	}) as Extract<CallArg, { UnresolvedObject: unknown }>[];
 
@@ -179,7 +179,7 @@ async function resolveObjectReferences(
 
 	const invalidObjects = Array.from(responsesById)
 		.filter(([_, obj]) => obj.error)
-		.map(([id, _obj]) => id);
+		.map(([_, obj]) => JSON.stringify(obj.error));
 
 	if (invalidObjects.length) {
 		throw new Error(`The following input objects are invalid: ${invalidObjects.join(', ')}`);
@@ -218,10 +218,11 @@ async function resolveObjectReferences(
 		const id = normalizeSuiAddress(input.UnresolvedObject.objectId);
 		const object = objectsById.get(id);
 
-		if (object?.initialSharedVersion) {
+		if (input.UnresolvedObject.initialSharedVersion ?? object?.initialSharedVersion) {
 			updated = Inputs.SharedObjectRef({
 				objectId: id,
-				initialSharedVersion: object.initialSharedVersion,
+				initialSharedVersion:
+					input.UnresolvedObject.initialSharedVersion || object?.initialSharedVersion!,
 				mutable: isUsedAsMutable(transactionData, index),
 			});
 		} else if (isUsedAsReceiving(transactionData, index)) {
@@ -390,7 +391,7 @@ async function normalizeInputs(
 						UnresolvedObject: {
 							objectId: inputValue,
 						},
-				  }
+					}
 				: input;
 
 			inputs[arg.Input] = unresolvedObject;
@@ -435,6 +436,10 @@ function isUsedAsMutable(transactionData: TransactionDataBuilder, index: number)
 			const argIndex = tx.MoveCall.arguments.indexOf(arg);
 			usedAsMutable = tx.MoveCall._argumentTypes[argIndex].ref !== '&' || usedAsMutable;
 		}
+
+		if (tx.$kind === 'MakeMoveVec' || tx.$kind === 'MergeCoins' || tx.$kind === 'SplitCoins') {
+			usedAsMutable = true;
+		}
 	});
 
 	return usedAsMutable;
@@ -468,7 +473,7 @@ function isReceivingType(type: OpenMoveTypeSignature): boolean {
 export function getClient(options: BuildTransactionOptions): SuiClient {
 	if (!options.client) {
 		throw new Error(
-			`No provider passed to Transaction#build, but transaction data was not sufficient to build offline.`,
+			`No sui client passed to Transaction#build, but transaction data was not sufficient to build offline.`,
 		);
 	}
 

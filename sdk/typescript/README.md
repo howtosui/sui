@@ -48,7 +48,11 @@ To get started you need to install [pnpm](https://pnpm.io/), then run the follow
 ```bash
 # Install all dependencies
 $ pnpm install
-# Run the build for the TypeScript SDK
+
+# Run `build` for the TypeScript SDK if you're in the `sdk/typescript` project
+$ pnpm run build
+
+# Run `sdk build` for the TypeScript SDK if you're in the root of `sui` repo
 $ pnpm sdk build
 ```
 
@@ -119,8 +123,8 @@ await client.getCoins({
 });
 ```
 
-For local development, you can run `cargo run --bin sui-test-validator` to spin up a local network
-with a local validator, a fullnode, and a faucet server. Refer to
+For local development, you can run `cargo run --bin --with-faucet --force-regenesis` to spin up a
+local network with a local validator, a fullnode, and a faucet server. Refer to
 [this guide](https://docs.sui.io/build/sui-local-network) for more information.
 
 ```typescript
@@ -174,7 +178,7 @@ For a primer for building transactions, refer to
 ```typescript
 import { getFullnodeUrl, SuiClient } from '@mysten/sui/client';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { TransactionBlock } from '@mysten/sui/transactions';
+import { Transaction } from '@mysten/sui/transactions';
 
 // Generate a new Ed25519 Keypair
 const keypair = new Ed25519Keypair();
@@ -182,14 +186,14 @@ const client = new SuiClient({
 	url: getFullnodeUrl('testnet'),
 });
 
-const tx = new TransactionBlock();
+const tx = new Transaction();
 tx.transferObjects(
 	['0xe19739da1a701eadc21683c5b127e62b553e833e8a15a4f292f4f48b4afea3f2'],
 	'0x1d20dcdb2bca4f508ea9613994683eb4e76e9c4ed371169677c1be02aaf0b12a',
 );
-const result = await client.signAndExecuteTransactionBlock({
+const result = await client.signAndExecuteTransaction({
 	signer: keypair,
-	transactionBlock: tx,
+	transaction: tx,
 });
 console.log({ result });
 ```
@@ -201,7 +205,7 @@ To transfer `1000` MIST to another address:
 ```typescript
 import { getFullnodeUrl, SuiClient } from '@mysten/sui/client';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { TransactionBlock } from '@mysten/sui/transactions';
+import { Transaction } from '@mysten/sui/transactions';
 
 // Generate a new Ed25519 Keypair
 const keypair = new Ed25519Keypair();
@@ -209,12 +213,12 @@ const client = new SuiClient({
 	url: getFullnodeUrl('testnet'),
 });
 
-const tx = new TransactionBlock();
+const tx = new Transaction();
 const [coin] = tx.splitCoins(tx.gas, [1000]);
 tx.transferObjects([coin], keypair.getPublicKey().toSuiAddress());
-const result = await client.signAndExecuteTransactionBlock({
+const result = await client.signAndExecuteTransaction({
 	signer: keypair,
-	transactionBlock: tx,
+	transaction: tx,
 });
 console.log({ result });
 ```
@@ -224,7 +228,7 @@ console.log({ result });
 ```typescript
 import { getFullnodeUrl, SuiClient } from '@mysten/sui/client';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { TransactionBlock } from '@mysten/sui/transactions';
+import { Transaction } from '@mysten/sui/transactions';
 
 // Generate a new Ed25519 Keypair
 const keypair = new Ed25519Keypair();
@@ -232,13 +236,13 @@ const client = new SuiClient({
 	url: getFullnodeUrl('testnet'),
 });
 
-const tx = new TransactionBlock();
+const tx = new Transaction();
 tx.mergeCoins('0xe19739da1a701eadc21683c5b127e62b553e833e8a15a4f292f4f48b4afea3f2', [
 	'0x127a8975134a4824d9288722c4ee4fc824cd22502ab4ad9f6617f3ba19229c1b',
 ]);
-const result = await client.signAndExecuteTransactionBlock({
+const result = await client.signAndExecuteTransaction({
 	signer: keypair,
-	transactionBlock: tx,
+	transaction: tx,
 });
 console.log({ result });
 ```
@@ -248,7 +252,7 @@ console.log({ result });
 ```typescript
 import { getFullnodeUrl, SuiClient } from '@mysten/sui/client';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { TransactionBlock } from '@mysten/sui/transactions';
+import { Transaction } from '@mysten/sui/transactions';
 
 // Generate a new Ed25519 Keypair
 const keypair = new Ed25519Keypair();
@@ -256,14 +260,14 @@ const client = new SuiClient({
 	url: getFullnodeUrl('testnet'),
 });
 const packageObjectId = '0x...';
-const tx = new TransactionBlock();
+const tx = new Transaction();
 tx.moveCall({
 	target: `${packageObjectId}::nft::mint`,
 	arguments: [tx.pure.string('Example NFT')],
 });
-const result = await client.signAndExecuteTransactionBlock({
+const result = await client.signAndExecuteTransaction({
 	signer: keypair,
-	transactionBlock: tx,
+	transaction: tx,
 });
 console.log({ result });
 ```
@@ -275,7 +279,7 @@ To publish a package:
 ```typescript
 import { getFullnodeUrl, SuiClient } from '@mysten/sui/client';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { TransactionBlock } from '@mysten/sui/transactions';
+import { Transaction } from '@mysten/sui/transactions';
 
 const { execSync } = require('child_process');
 // Generate a new Ed25519 Keypair
@@ -288,15 +292,15 @@ const { modules, dependencies } = JSON.parse(
 		encoding: 'utf-8',
 	}),
 );
-const tx = new TransactionBlock();
+const tx = new Transaction();
 const [upgradeCap] = tx.publish({
 	modules,
 	dependencies,
 });
-tx.transferObjects([upgradeCap], await client.getAddress());
-const result = await client.signAndExecuteTransactionBlock({
+tx.transferObjects([upgradeCap], keypair.toSuiAddress());
+const result = await client.signAndExecuteTransaction({
 	signer: keypair,
-	transactionBlock: tx,
+	transaction: tx,
 });
 console.log({ result });
 ```
@@ -472,49 +476,5 @@ const client = new SuiClient({
 const events = client.queryEvents({
 	query: { Sender: toolbox.address() },
 	limit: 2,
-});
-```
-
-Subscribe to all events created by transactions sent by account
-`0xcc2bd176a478baea9a0de7a24cd927661cc6e860d5bacecb9a138ef20dbab231`
-
-```typescript
-import { getFullnodeUrl, SuiClient } from '@mysten/sui/client';
-
-const client = new SuiClient({
-	url: getFullnodeUrl('testnet'),
-});
-// calls RPC method 'suix_subscribeEvent' with params:
-// [ { Sender: '0xbff6ccc8707aa517b4f1b95750a2a8c666012df3' } ]
-const unsubscribe = await client.subscribeEvent({
-	filter: {
-		Sender: '0xcc2bd176a478baea9a0de7a24cd927661cc6e860d5bacecb9a138ef20dbab231',
-	},
-	onMessage(event) {
-		// handle subscription notification message here. This function is called once per subscription message.
-	},
-});
-
-// later, to unsubscribe:
-await unsubscribe();
-```
-
-Subscribe to all events created by a package's `nft` module
-
-```typescript
-import { getFullnodeUrl, SuiClient } from '@mysten/sui/client';
-
-const client = new SuiClient({
-	url: getFullnodeUrl('testnet'),
-});
-const somePackage = '0x...';
-const devnetNftFilter = {
-	MoveModule: { package: somePackage, module: 'nft' },
-};
-const devNftSub = await client.subscribeEvent({
-	filter: devnetNftFilter,
-	onMessage(event) {
-		// handle subscription notification message here
-	},
 });
 ```

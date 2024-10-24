@@ -267,6 +267,7 @@ impl StateSyncConfig {
 /// * If the node marks itself as Private, only nodes that have it in
 ///     their `allowlisted_peers` or `seed_peers` will try to connect to it.
 /// * If not set, defaults to Public.
+///
 /// AccessType is useful when a network of nodes want to stay private. To achieve this,
 /// mark every node in this network as `Private` and allowlist/seed them to each other.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -380,6 +381,12 @@ pub struct RandomnessConfig {
     /// If unspecified, this will default to 20.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub send_partial_signatures_inflight_limit: Option<usize>,
+
+    /// Maximum proportion of total peer weight to ignore in case of byzantine behavior.
+    ///
+    /// If unspecified, this will default to 0.2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_ignored_peer_weight_factor: Option<f64>,
 }
 
 impl RandomnessConfig {
@@ -416,5 +423,12 @@ impl RandomnessConfig {
 
         self.send_partial_signatures_inflight_limit
             .unwrap_or(SEND_PARTIAL_SIGNATURES_INFLIGHT_LIMIT)
+    }
+
+    pub fn max_ignored_peer_weight_factor(&self) -> f64 {
+        const MAX_IGNORED_PEER_WEIGHT_FACTOR: f64 = 0.2;
+
+        self.max_ignored_peer_weight_factor
+            .unwrap_or(MAX_IGNORED_PEER_WEIGHT_FACTOR)
     }
 }

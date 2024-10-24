@@ -7,8 +7,9 @@ use crate::crypto::{AuthoritySignInfo, AuthoritySignature, SuiAuthoritySignature
 use crate::effects::{TransactionEffects, TransactionEffectsAPI};
 use crate::gas::GasCostSummary;
 use crate::messages_checkpoint::{
-    CertifiedCheckpointSummary, CheckpointContents, CheckpointSummary, EndOfEpochData,
-    FullCheckpointContents, VerifiedCheckpoint, VerifiedCheckpointContents,
+    CertifiedCheckpointSummary, CheckpointContents, CheckpointSummary,
+    CheckpointVersionSpecificData, EndOfEpochData, FullCheckpointContents, VerifiedCheckpoint,
+    VerifiedCheckpointContents,
 };
 use crate::transaction::VerifiedTransaction;
 use fastcrypto::traits::Signer;
@@ -60,6 +61,17 @@ impl MockCheckpointBuilder {
 
         self.transactions
             .push(VerifiedExecutionData::new(transaction, effects))
+    }
+
+    pub fn override_last_checkpoint_number(
+        &mut self,
+        checkpoint_number: u64,
+        validator_keys: &impl ValidatorKeypairProvider,
+    ) {
+        let mut summary = self.previous_checkpoint.data().clone();
+        summary.sequence_number = checkpoint_number;
+        let checkpoint = Self::create_certified_checkpoint(validator_keys, summary);
+        self.previous_checkpoint = checkpoint;
     }
 
     /// Builds a checkpoint using internally buffered transactions.
@@ -147,7 +159,8 @@ impl MockCheckpointBuilder {
             epoch_rolling_gas_cost_summary,
             end_of_epoch_data,
             timestamp_ms,
-            version_specific_data: Vec::new(),
+            version_specific_data: bcs::to_bytes(&CheckpointVersionSpecificData::empty_for_tests())
+                .unwrap(),
             checkpoint_commitments: Default::default(),
         };
 

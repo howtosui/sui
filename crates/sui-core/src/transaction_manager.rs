@@ -3,12 +3,13 @@
 
 use std::{
     cmp::{max, Reverse},
-    collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
+    collections::{hash_map, BTreeSet, BinaryHeap, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
 
 use lru::LruCache;
+use mysten_common::fatal;
 use mysten_metrics::monitored_scope;
 use parking_lot::RwLock;
 use sui_types::{
@@ -43,7 +44,7 @@ const MIN_HASHMAP_CAPACITY: usize = 1000;
 
 /// TransactionManager is responsible for managing object dependencies of pending transactions,
 /// and publishing a stream of certified transactions (certificates) ready to execute.
-/// It receives certificates from Narwhal, validator RPC handlers, and checkpoint executor.
+/// It receives certificates from consensus, validator RPC handlers, and checkpoint executor.
 /// Execution driver subscribes to the stream of ready certificates from TransactionManager, and
 /// executes them in parallel.
 /// The actual execution logic is inside AuthorityState. After a transaction commits and updates
@@ -62,6 +63,7 @@ pub struct TransactionManager {
 #[derive(Clone, Debug)]
 pub struct PendingCertificateStats {
     // The time this certificate enters transaction manager.
+    #[allow(unused)]
     pub enqueue_time: Instant,
     // The time this certificate becomes ready for execution.
     pub ready_time: Option<Instant>,
@@ -413,7 +415,7 @@ impl TransactionManager {
                     .transaction_cache_read
                     .is_tx_already_executed(&digest)
                     .unwrap_or_else(|err| {
-                        panic!("Failed to check if tx is already executed: {:?}", err)
+                        fatal!("Failed to check if tx is already executed: {:?}", err)
                     })
                 {
                     self.metrics
@@ -431,7 +433,7 @@ impl TransactionManager {
         let mut receiving_objects: HashSet<InputKey> = HashSet::new();
         let certs: Vec<_> = certs
             .into_iter()
-            .map(|(cert, fx_digest)| {
+            .filter_map(|(cert, fx_digest)| {
                 let input_object_kinds = cert
                     .data()
                     .intent_message()
@@ -439,7 +441,24 @@ impl TransactionManager {
                     .input_objects()
                     .expect("input_objects() cannot fail");
                 let mut input_object_keys =
-                    epoch_store.get_input_object_keys(&cert.key(), &input_object_kinds);
+                    match epoch_store.get_input_object_keys(&cert.key(), &input_object_kinds) {
+                        Ok(keys) => keys,
+                        Err(e) => {
+                            // Because we do not hold the transaction lock during enqueue, it is possible
+                            // that the transaction was executed and the shared version assignments deleted
+                            // since the earlier check. This is a rare race condition, and it is better to
+                            // handle it ad-hoc here than to hold tx locks for every cert for the duration
+                            // of this function in order to remove the race.
+                            if self
+                                .transaction_cache_read
+                                .is_tx_already_executed(cert.digest())
+                                .expect("is_tx_already_executed cannot fail")
+                            {
+                                return None;
+                            }
+                            fatal!("Failed to get input object keys: {:?}", e);
+                        }
+                    };
 
                 if input_object_kinds.len() != input_object_keys.len() {
                     error!("Duplicated input objects: {:?}", input_object_kinds);
@@ -466,7 +485,7 @@ impl TransactionManager {
                     }
                 }
 
-                (cert, fx_digest, input_object_keys)
+                Some((cert, fx_digest, input_object_keys))
             })
             .collect();
 
@@ -862,7 +881,7 @@ impl TransactionManager {
 
     // Verify TM has no pending item for tests.
     #[cfg(test)]
-    fn check_empty_for_testing(&self) {
+    pub(crate) fn check_empty_for_testing(&self) {
         let reconfig_lock = self.inner.read();
         let inner = reconfig_lock.read();
         assert!(
@@ -951,28 +970,44 @@ impl TransactionQueue {
         self.digests.is_empty()
     }
 
+    /// Insert the digest into the queue with the given time. If the digest is
+    /// already in the queue, this is a no-op.
     fn insert(&mut self, digest: TransactionDigest, time: Instant) {
-        if self.digests.insert(digest, time).is_none() {
+        if let hash_map::Entry::Vacant(entry) = self.digests.entry(digest) {
+            entry.insert(time);
             self.ages.push((Reverse(time), digest));
         }
     }
 
+    /// Remove the digest from the queue. Returns the time the digest was
+    /// inserted into the queue, if it was present.
+    ///
+    /// After removing the digest, first() will return the new oldest entry
+    /// in the queue (which may be unchanged).
     fn remove(&mut self, digest: &TransactionDigest) -> Option<Instant> {
-        let Some(when) = self.digests.remove(digest) else {
-            return None;
-        };
+        let when = self.digests.remove(digest)?;
 
-        while !self.ages.is_empty()
-            && !self
-                .digests
-                .contains_key(&self.ages.peek().expect("heap cannot be empty").1)
-        {
+        // This loop removes all previously inserted entries that no longer
+        // correspond to live entries in self.digests. When the loop terminates,
+        // the top of the heap will be the oldest live entry.
+        // Amortized complexity of `remove` is O(lg(n)).
+        while !self.ages.is_empty() {
+            let first = self.ages.peek().expect("heap cannot be empty");
+
+            // We compare the exact time of the entry, because there may be an
+            // entry in the heap that was previously inserted and removed from
+            // digests, and we want to ignore it. (see test_transaction_queue_remove_in_order)
+            if self.digests.get(&first.1) == Some(&first.0 .0) {
+                break;
+            }
+
             self.ages.pop();
         }
 
         Some(when)
     }
 
+    /// Return the oldest entry in the queue.
     fn first(&self) -> Option<(Instant, TransactionDigest)> {
         self.ages.peek().map(|(time, digest)| (time.0, *digest))
     }
@@ -982,6 +1017,7 @@ impl TransactionQueue {
 mod test {
     use super::*;
     use prometheus::Registry;
+    use rand::{Rng, RngCore};
 
     #[test]
     #[cfg_attr(msim, ignore)]
@@ -1113,5 +1149,108 @@ mod test {
         assert_eq!(queue.remove(&digest1), Some(time1));
 
         assert_eq!(queue.first(), None);
+    }
+
+    #[test]
+    #[cfg_attr(msim, ignore)]
+    fn test_transaction_queue_reinsert() {
+        // insert two items
+        let time1 = Instant::now();
+        let digest1 = TransactionDigest::new([1; 32]);
+        let time2 = time1 + Duration::from_secs(1);
+        let digest2 = TransactionDigest::new([2; 32]);
+
+        let mut queue = TransactionQueue::default();
+        queue.insert(digest1, time1);
+        queue.insert(digest2, time2);
+
+        // remove the second item
+        queue.remove(&digest2);
+        assert_eq!(queue.first(), Some((time1, digest1)));
+
+        // insert the second item again
+        let time3 = time2 + Duration::from_secs(1);
+        queue.insert(digest2, time3);
+
+        // remove the first item
+        queue.remove(&digest1);
+
+        // time3 should be in first()
+        assert_eq!(queue.first(), Some((time3, digest2)));
+    }
+
+    #[test]
+    #[cfg_attr(msim, ignore)]
+    fn test_transaction_queue_double_insert() {
+        let time1 = Instant::now();
+        let digest1 = TransactionDigest::new([1; 32]);
+        let time2 = time1 + Duration::from_secs(1);
+        let digest2 = TransactionDigest::new([2; 32]);
+        let time3 = time2 + Duration::from_secs(1);
+
+        let mut queue = TransactionQueue::default();
+        queue.insert(digest1, time1);
+        queue.insert(digest2, time2);
+        queue.insert(digest2, time3);
+
+        // re-insertion of digest2 should not change its time
+        assert_eq!(queue.first(), Some((time1, digest1)));
+        queue.remove(&digest1);
+        assert_eq!(queue.first(), Some((time2, digest2)));
+    }
+
+    #[test]
+    #[cfg_attr(msim, ignore)]
+    fn transaction_queue_random_test() {
+        let mut rng = rand::thread_rng();
+        let mut digests = Vec::new();
+        for _ in 0..100 {
+            let mut digest = [0; 32];
+            rng.fill_bytes(&mut digest);
+            digests.push(TransactionDigest::new(digest));
+        }
+
+        let mut verifier = HashMap::new();
+        let mut queue = TransactionQueue::default();
+
+        let mut now = Instant::now();
+
+        // first insert some random digests so that the queue starts
+        // out well-populated
+        for _ in 0..70 {
+            now += Duration::from_secs(1);
+            let digest = digests[rng.gen_range(0..digests.len())];
+            let time = now;
+            queue.insert(digest, time);
+            verifier.entry(digest).or_insert(time);
+        }
+
+        // Do random operations on both the queue and the verifier, and
+        // verify that the two structures always agree
+        for _ in 0..100000 {
+            // advance time
+            now += Duration::from_secs(1);
+
+            // pick a random digest
+            let digest = digests[rng.gen_range(0..digests.len())];
+
+            // either insert or remove it
+            if rng.gen_bool(0.5) {
+                let time = now;
+                queue.insert(digest, time);
+                verifier.entry(digest).or_insert(time);
+            } else {
+                let time = verifier.remove(&digest);
+                assert_eq!(queue.remove(&digest), time);
+            }
+
+            assert_eq!(
+                queue.first(),
+                verifier
+                    .iter()
+                    .min_by_key(|(_, time)| **time)
+                    .map(|(digest, time)| (*time, *digest))
+            );
+        }
     }
 }

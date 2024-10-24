@@ -15,6 +15,7 @@ use simulacrum::SimulatorStore;
 use simulator_persisted_store::PersistedStore;
 use std::path::Path;
 use std::sync::Arc;
+use sui_core::authority::authority_per_epoch_store::CertLockGuard;
 use sui_core::authority::authority_test_utils::send_and_confirm_transaction_with_execution_error;
 use sui_core::authority::AuthorityState;
 use sui_json_rpc::authority_state::StateRead;
@@ -24,6 +25,7 @@ use sui_storage::key_value_store::TransactionKeyValueStore;
 use sui_types::base_types::ObjectID;
 use sui_types::base_types::SuiAddress;
 use sui_types::base_types::VersionNumber;
+use sui_types::committee::EpochId;
 use sui_types::digests::TransactionDigest;
 use sui_types::digests::TransactionEventsDigest;
 use sui_types::effects::TransactionEffects;
@@ -126,6 +128,7 @@ impl TransactionalAdapter for ValidatorWithFullnode {
             Some(&self.fullnode),
             transaction,
             with_shared,
+            false,
         )
         .await?;
         Ok((effects.into_data(), execution_error))
@@ -140,9 +143,11 @@ impl TransactionalAdapter for ValidatorWithFullnode {
         );
 
         let epoch_store = self.validator.load_epoch_store_one_call_per_task().clone();
-        self.validator
-            .read_objects_for_execution(&tx, &epoch_store)
-            .await
+        self.validator.read_objects_for_execution(
+            &CertLockGuard::dummy_for_tests(),
+            &tx,
+            &epoch_store,
+        )
     }
 
     fn prepare_txn(
@@ -217,7 +222,9 @@ impl TransactionalAdapter for ValidatorWithFullnode {
     }
 
     async fn advance_epoch(&mut self, _create_random_state: bool) -> anyhow::Result<()> {
-        unimplemented!("advance_epoch not supported")
+        self.validator.reconfigure_for_testing().await;
+        self.fullnode.reconfigure_for_testing().await;
+        Ok(())
     }
 
     async fn request_gas(
@@ -252,6 +259,10 @@ impl ReadStore for ValidatorWithFullnode {
         _epoch: sui_types::committee::EpochId,
     ) -> sui_types::storage::error::Result<Option<Arc<sui_types::committee::Committee>>> {
         todo!()
+    }
+
+    fn get_latest_epoch_id(&self) -> sui_types::storage::error::Result<EpochId> {
+        Ok(self.validator.epoch_store_for_testing().epoch())
     }
 
     fn get_latest_checkpoint(&self) -> sui_types::storage::error::Result<VerifiedCheckpoint> {

@@ -1,13 +1,16 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::abi::{EthBridgeCommittee, EthSuiBridge};
-use crate::config::BridgeNodeConfig;
-use crate::config::EthConfig;
-use crate::config::SuiConfig;
+use crate::abi::{
+    EthBridgeCommittee, EthBridgeConfig, EthBridgeLimiter, EthBridgeVault, EthSuiBridge,
+};
+use crate::config::{
+    default_ed25519_key_pair, BridgeNodeConfig, EthConfig, MetricsConfig, SuiConfig, WatchdogConfig,
+};
 use crate::crypto::BridgeAuthorityKeyPair;
 use crate::crypto::BridgeAuthorityPublicKeyBytes;
 use crate::server::APPLICATION_JSON;
+use crate::types::BridgeCommittee;
 use crate::types::{AddTokensOnSuiAction, BridgeAction};
 use anyhow::anyhow;
 use ethers::core::k256::ecdsa::SigningKey;
@@ -22,6 +25,7 @@ use fastcrypto::secp256k1::Secp256k1KeyPair;
 use fastcrypto::traits::EncodeDecodeBase64;
 use fastcrypto::traits::KeyPair;
 use futures::future::join_all;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -35,14 +39,24 @@ use sui_test_transaction_builder::TestTransactionBuilder;
 use sui_types::base_types::SuiAddress;
 use sui_types::bridge::BridgeChainId;
 use sui_types::bridge::{BRIDGE_MODULE_NAME, BRIDGE_REGISTER_FOREIGN_TOKEN_FUNCTION_NAME};
+use sui_types::committee::StakeUnit;
 use sui_types::crypto::get_key_pair;
 use sui_types::crypto::SuiKeyPair;
 use sui_types::crypto::ToFromBytes;
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+use sui_types::sui_system_state::sui_system_state_summary::SuiSystemStateSummary;
 use sui_types::transaction::{ObjectArg, TransactionData};
 use sui_types::BRIDGE_PACKAGE_ID;
 
 pub type EthSigner = SignerMiddleware<Provider<Http>, Wallet<SigningKey>>;
+
+pub struct EthBridgeContracts<P> {
+    pub bridge: EthSuiBridge<Provider<P>>,
+    pub committee: EthBridgeCommittee<Provider<P>>,
+    pub limiter: EthBridgeLimiter<Provider<P>>,
+    pub vault: EthBridgeVault<Provider<P>>,
+    pub config: EthBridgeConfig<Provider<P>>,
+}
 
 /// Generate Bridge Authority key (Secp256k1KeyPair) and write to a file as base64 encoded `privkey`.
 pub fn generate_bridge_authority_key_and_write_to_file(
@@ -93,11 +107,13 @@ pub fn generate_bridge_client_key_and_write_to_file(
 pub async fn get_eth_contract_addresses<P: ethers::providers::JsonRpcClient + 'static>(
     bridge_proxy_address: EthAddress,
     provider: &Arc<Provider<P>>,
-) -> anyhow::Result<(EthAddress, EthAddress, EthAddress, EthAddress)> {
+) -> anyhow::Result<(EthAddress, EthAddress, EthAddress, EthAddress, EthAddress)> {
     let sui_bridge = EthSuiBridge::new(bridge_proxy_address, provider.clone());
     let committee_address: EthAddress = sui_bridge.committee().call().await?;
     let limiter_address: EthAddress = sui_bridge.limiter().call().await?;
     let vault_address: EthAddress = sui_bridge.vault().call().await?;
+    let vault = EthBridgeVault::new(vault_address, provider.clone());
+    let weth_address: EthAddress = vault.w_eth().call().await?;
     let committee = EthBridgeCommittee::new(committee_address, provider.clone());
     let config_address: EthAddress = committee.config().call().await?;
 
@@ -106,7 +122,32 @@ pub async fn get_eth_contract_addresses<P: ethers::providers::JsonRpcClient + 's
         limiter_address,
         vault_address,
         config_address,
+        weth_address,
     ))
+}
+
+/// Given the address of SuiBridge Proxy, return the contracts of the committee, limiter, vault, and config.
+pub async fn get_eth_contracts<P: ethers::providers::JsonRpcClient + 'static>(
+    bridge_proxy_address: EthAddress,
+    provider: &Arc<Provider<P>>,
+) -> anyhow::Result<EthBridgeContracts<P>> {
+    let sui_bridge = EthSuiBridge::new(bridge_proxy_address, provider.clone());
+    let committee_address: EthAddress = sui_bridge.committee().call().await?;
+    let limiter_address: EthAddress = sui_bridge.limiter().call().await?;
+    let vault_address: EthAddress = sui_bridge.vault().call().await?;
+    let committee = EthBridgeCommittee::new(committee_address, provider.clone());
+    let config_address: EthAddress = committee.config().call().await?;
+
+    let limiter = EthBridgeLimiter::new(limiter_address, provider.clone());
+    let vault = EthBridgeVault::new(vault_address, provider.clone());
+    let config = EthBridgeConfig::new(config_address, provider.clone());
+    Ok(EthBridgeContracts {
+        bridge: sui_bridge,
+        committee,
+        limiter,
+        vault,
+        config,
+    })
 }
 
 /// Read bridge key from a file and print the corresponding information.
@@ -161,6 +202,18 @@ pub fn generate_bridge_node_config_and_write_to_file(
         approved_governance_actions: vec![],
         run_client,
         db_path: None,
+        metrics_key_pair: default_ed25519_key_pair(),
+        metrics: Some(MetricsConfig {
+            push_interval_seconds: None, // use default value
+            push_url: "metrics_proxy_url".to_string(),
+        }),
+        watchdog_config: Some(WatchdogConfig {
+            total_supplies: BTreeMap::from_iter(vec![(
+                "eth".to_string(),
+                "0xd0e89b2af5e4910726fbcd8b8dd37bb79b29e5f83f7491bca830e94f7f226d29::eth::ETH"
+                    .to_string(),
+            )]),
+        }),
     };
     if run_client {
         config.sui.bridge_client_key_path = Some(PathBuf::from("/path/to/your/bridge_client_key"));
@@ -337,4 +390,54 @@ pub async fn wait_for_server_to_be_up(server_url: String, timeout_sec: u64) -> a
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
     Ok(())
+}
+
+/// Return a mappping from validator name to their bridge voting power.
+/// If a validator is not in the Sui committee, we will use its base URL as the name.
+pub async fn get_committee_voting_power_by_name(
+    bridge_committee: &Arc<BridgeCommittee>,
+    system_state: &SuiSystemStateSummary,
+) -> BTreeMap<String, StakeUnit> {
+    let mut sui_committee: BTreeMap<_, _> = system_state
+        .active_validators
+        .iter()
+        .map(|v| (v.sui_address, v.name.clone()))
+        .collect();
+    bridge_committee
+        .members()
+        .iter()
+        .map(|v| {
+            (
+                sui_committee
+                    .remove(&v.1.sui_address)
+                    .unwrap_or(v.1.base_url.clone()),
+                v.1.voting_power,
+            )
+        })
+        .collect()
+}
+
+/// Return a mappping from validator pub keys to their names.
+/// If a validator is not in the Sui committee, we will use its base URL as the name.
+pub async fn get_validator_names_by_pub_keys(
+    bridge_committee: &Arc<BridgeCommittee>,
+    system_state: &SuiSystemStateSummary,
+) -> BTreeMap<BridgeAuthorityPublicKeyBytes, String> {
+    let mut sui_committee: BTreeMap<_, _> = system_state
+        .active_validators
+        .iter()
+        .map(|v| (v.sui_address, v.name.clone()))
+        .collect();
+    bridge_committee
+        .members()
+        .iter()
+        .map(|(name, validator)| {
+            (
+                name.clone(),
+                sui_committee
+                    .remove(&validator.sui_address)
+                    .unwrap_or(validator.base_url.clone()),
+            )
+        })
+        .collect()
 }
